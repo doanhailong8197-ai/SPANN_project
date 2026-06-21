@@ -504,11 +504,14 @@ class SPANN_model:
 
     """
 
-    def __init__(self, x_dim, z_dim, enc, dec, class_num, device):
+    def __init__(self, x_dim, z_dim, enc, dec, class_num, device, tau=0.5):
         super().__init__()
         self.class_num = class_num
         self.device = device
         self.feat_dim = enc[-1][1]
+        # tau: temperature parameter cho Spatial Contrastive Loss (InfoNCE).
+        # Giá trị nhỏ hơn → phân phối sharper, discriminative hơn.
+        self.tau = tau
         self.encoder = Encoder(x_dim, enc).to(device)
         self.decoder = Decoder(z_dim, dec).to(device)
         self.classifier = CLS(z_dim, class_num).to(device)
@@ -665,20 +668,41 @@ class SPANN_model:
                     batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
                     # Spatial alignment loss
                     if iteration > miditer3:
-                        # Spatial alignment loss
-                        spa_dist_mat = distance_gmm(
-                            mu_target[high_conf_idx],
-                            mu_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                        )
-                        spa_dist_mat = spa_dist_mat / torch.max(spa_dist_mat)
-                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)
-                        coor_dist_mat = coor_dist_mat / torch.max(coor_dist_mat)
-                        index = torch.topk(coor_dist_mat, k=k, largest=False)[1]
-                        for i in range(len(id_target_high_conf)):
-                            spa_loss += torch.norm(spa_dist_mat[i][index[i]] - coor_dist_mat[i][index[i]]) / (k - 1)
-                        spa_loss /= len(id_target_high_conf)
+                        # ── Spatial Contrastive Loss / InfoNCE (thay thế Frobenius norm) ──────
+                        # Positive pairs: các tế bào lân cận vật lý (top-k gần nhất theo tọa độ).
+                        # Negative pairs: các tế bào không phải hàng xóm — lấy mẫu ngẫu nhiên.
+                        # InfoNCE kéo positive gần nhau và đẩy negative ra xa trong không gian Z_sp.
+
+                        # Lấy latent Z của các high-confidence cells và L2-normalize
+                        z_sp = F.normalize(mu_target[high_conf_idx], dim=1)  # (N, D)
+                        N = z_sp.size(0)
+
+                        # Tính ma trận khoảng cách vật lý để xác định positive pairs
+                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)  # (N, N)
+                        # top-k lân cận không gian gần nhất (k nhỏ nhất, bỏ diagonal)
+                        coor_dist_diag_fill = coor_dist_mat + torch.max(coor_dist_mat) * torch.eye(N, device=self.device)
+                        pos_idx = torch.topk(coor_dist_diag_fill, k=k, largest=False)[1]  # (N, k)
+
+                        # Xây dựng boolean mask: pos_mask[i, j] = True nếu j là neighbor của i
+                        pos_mask = torch.zeros(N, N, dtype=torch.bool, device=self.device)
+                        pos_mask.scatter_(1, pos_idx, True)  # (N, N)
+
+                        # Ma trận cosine similarity giữa tất cả các cặp tế bào
+                        # Chia temperature tau để kiểm soát độ sắc nét của phân phối
+                        sim_matrix = torch.matmul(z_sp, z_sp.t()) / self.tau  # (N, N)
+                        # Triệt tiêu diagonal (self-similarity) bằng giá trị rất âm
+                        sim_matrix = sim_matrix.masked_fill(torch.eye(N, dtype=torch.bool, device=self.device), float('-inf'))
+
+                        # InfoNCE Loss (vectorized, không dùng vòng lặp for):
+                        # L_i = -mean_{j ∈ pos(i)} [ s_{ij}/tau - log Σ_{l≠i} exp(s_{il}/tau) ]
+                        log_sum_exp = torch.logsumexp(sim_matrix, dim=1, keepdim=True)  # (N, 1)
+                        # log-softmax của tất cả cặp: log_prob[i,j] = s_ij/tau - log Σ exp
+                        log_prob = sim_matrix - log_sum_exp  # (N, N)
+                        # Tính trung bình log-likelihood trên tất cả positive pairs của mỗi anchor
+                        num_pos = pos_mask.float().sum(dim=1).clamp(min=1)  # (N,) — tránh chia 0
+                        spa_loss = -(log_prob * pos_mask.float()).sum(dim=1) / num_pos  # (N,)
+                        spa_loss = spa_loss.mean()
+                        # ─────────────────────────────────────────────────────────────────────
 
                     # cell type ot alignment
                     if beta is None:
@@ -716,11 +740,30 @@ class SPANN_model:
                     dist_mat = pdists(batch_coor[high_conf_idx])
                     dist_mat += torch.max(dist_mat) * torch.eye(dist_mat.shape[0]).to(self.device)
                     _, spatial_nb_idx = torch.min(dist_mat, 1)
+                    # ── Adaptive-weight L_neighbor_sp (chống Over-smoothing) ──────────────
+                    # Lấy latent feature (before_lincls_feat_t) của các high-conf cells và
+                    # L2-normalize để tính cosine similarity một cách vectorized.
+                    z_hc = F.normalize(before_lincls_feat_t[high_conf_idx], dim=1)  # (N, D)
+
+                    # Dot product giữa L2-normalized vectors = cosine similarity.
+                    # z_hc[spatial_nb_idx] là latent của neighbor tương ứng với mỗi anchor.
+                    cos_sim = (z_hc * z_hc[spatial_nb_idx]).sum(dim=1)  # (N,)
+
+                    # Chuyển thành trọng số alpha_ij trong khoảng [0, 1].
+                    # clamp_min(0) (tương đương ReLU): nếu hai tế bào ở ranh giới mô
+                    # (cos_sim < 0 → hoàn toàn khác nhau) thì alpha_ij = 0,
+                    # loss cặp đó bị triệt tiêu hoàn toàn — không ép chia sẻ nhãn.
+                    alpha_ij = torch.clamp(cos_sim, min=0.0)  # (N,), giá trị trong [0, 1]
+
+                    # Cross-entropy có trọng số adaptive theo cả hai chiều anchor↔neighbor
                     spatial_nb_output = after_lincls_t[high_conf_idx][spatial_nb_idx, :]
                     neighbor_Q_spatial = Q_t[spatial_nb_idx, :]
-                    spatial_loss += -torch.sum(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx]))
-                    spatial_loss += -torch.sum(Q_t * F.log_softmax(spatial_nb_output))
-                    spatial_loss /= 2 * len(batch_coor_high_conf)
+                    ce_anchor   = -(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx], dim=1)).sum(dim=1)  # (N,)
+                    ce_neighbor = -(Q_t             * F.log_softmax(spatial_nb_output,                  dim=1)).sum(dim=1)  # (N,)
+
+                    # Áp dụng trọng số alpha_ij (detach để gradient không chảy ngược qua attention)
+                    spatial_loss = (alpha_ij.detach() * (ce_anchor + ce_neighbor)).sum() / 2
+                    # ─────────────────────────────────────────────────────────────────────
 
                     #             feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
                     feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
@@ -1042,20 +1085,41 @@ class SPANN_model:
                     batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
                     # Spatial alignment loss
                     if iteration > miditer3:
-                        # Spatial alignment loss
-                        spa_dist_mat = distance_gmm(
-                            mu_target[high_conf_idx],
-                            mu_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                        )
-                        spa_dist_mat = spa_dist_mat / torch.max(spa_dist_mat)
-                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)
-                        coor_dist_mat = coor_dist_mat / torch.max(coor_dist_mat)
-                        index = torch.topk(coor_dist_mat, k=k, largest=False)[1]
-                        for i in range(len(id_target_high_conf)):
-                            spa_loss += torch.norm(spa_dist_mat[i][index[i]] - coor_dist_mat[i][index[i]]) / (k - 1)
-                        spa_loss /= len(id_target_high_conf)
+                        # ── Spatial Contrastive Loss / InfoNCE (thay thế Frobenius norm) ──────
+                        # Positive pairs: các tế bào lân cận vật lý (top-k gần nhất theo tọa độ).
+                        # Negative pairs: các tế bào không phải hàng xóm — lấy mẫu ngẫu nhiên.
+                        # InfoNCE kéo positive gần nhau và đẩy negative ra xa trong không gian Z_sp.
+
+                        # Lấy latent Z của các high-confidence cells và L2-normalize
+                        z_sp = F.normalize(mu_target[high_conf_idx], dim=1)  # (N, D)
+                        N = z_sp.size(0)
+
+                        # Tính ma trận khoảng cách vật lý để xác định positive pairs
+                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)  # (N, N)
+                        # top-k lân cận không gian gần nhất (k nhỏ nhất, bỏ diagonal)
+                        coor_dist_diag_fill = coor_dist_mat + torch.max(coor_dist_mat) * torch.eye(N, device=self.device)
+                        pos_idx = torch.topk(coor_dist_diag_fill, k=k, largest=False)[1]  # (N, k)
+
+                        # Xây dựng boolean mask: pos_mask[i, j] = True nếu j là neighbor của i
+                        pos_mask = torch.zeros(N, N, dtype=torch.bool, device=self.device)
+                        pos_mask.scatter_(1, pos_idx, True)  # (N, N)
+
+                        # Ma trận cosine similarity giữa tất cả các cặp tế bào
+                        # Chia temperature tau để kiểm soát độ sắc nét của phân phối
+                        sim_matrix = torch.matmul(z_sp, z_sp.t()) / self.tau  # (N, N)
+                        # Triệt tiêu diagonal (self-similarity) bằng giá trị rất âm
+                        sim_matrix = sim_matrix.masked_fill(torch.eye(N, dtype=torch.bool, device=self.device), float('-inf'))
+
+                        # InfoNCE Loss (vectorized, không dùng vòng lặp for):
+                        # L_i = -mean_{j ∈ pos(i)} [ s_{ij}/tau - log Σ_{l≠i} exp(s_{il}/tau) ]
+                        log_sum_exp = torch.logsumexp(sim_matrix, dim=1, keepdim=True)  # (N, 1)
+                        # log-softmax của tất cả cặp: log_prob[i,j] = s_ij/tau - log Σ exp
+                        log_prob = sim_matrix - log_sum_exp  # (N, N)
+                        # Tính trung bình log-likelihood trên tất cả positive pairs của mỗi anchor
+                        num_pos = pos_mask.float().sum(dim=1).clamp(min=1)  # (N,) — tránh chia 0
+                        spa_loss = -(log_prob * pos_mask.float()).sum(dim=1) / num_pos  # (N,)
+                        spa_loss = spa_loss.mean()
+                        # ─────────────────────────────────────────────────────────────────────
 
                     # cell type ot alignment
                     if beta is None:
@@ -1093,11 +1157,30 @@ class SPANN_model:
                     dist_mat = pdists(batch_coor[high_conf_idx])
                     dist_mat += torch.max(dist_mat) * torch.eye(dist_mat.shape[0]).to(self.device)
                     _, spatial_nb_idx = torch.min(dist_mat, 1)
+                    # ── Adaptive-weight L_neighbor_sp (chống Over-smoothing) ──────────────
+                    # Lấy latent feature (before_lincls_feat_t) của các high-conf cells và
+                    # L2-normalize để tính cosine similarity một cách vectorized.
+                    z_hc = F.normalize(before_lincls_feat_t[high_conf_idx], dim=1)  # (N, D)
+
+                    # Dot product giữa L2-normalized vectors = cosine similarity.
+                    # z_hc[spatial_nb_idx] là latent của neighbor tương ứng với mỗi anchor.
+                    cos_sim = (z_hc * z_hc[spatial_nb_idx]).sum(dim=1)  # (N,)
+
+                    # Chuyển thành trọng số alpha_ij trong khoảng [0, 1].
+                    # clamp_min(0) (tương đương ReLU): nếu hai tế bào ở ranh giới mô
+                    # (cos_sim < 0 → hoàn toàn khác nhau) thì alpha_ij = 0,
+                    # loss cặp đó bị triệt tiêu hoàn toàn — không ép chia sẻ nhãn.
+                    alpha_ij = torch.clamp(cos_sim, min=0.0)  # (N,), giá trị trong [0, 1]
+
+                    # Cross-entropy có trọng số adaptive theo cả hai chiều anchor↔neighbor
                     spatial_nb_output = after_lincls_t[high_conf_idx][spatial_nb_idx, :]
                     neighbor_Q_spatial = Q_t[spatial_nb_idx, :]
-                    spatial_loss += -torch.sum(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx]))
-                    spatial_loss += -torch.sum(Q_t * F.log_softmax(spatial_nb_output))
-                    spatial_loss /= 2 * len(batch_coor_high_conf)
+                    ce_anchor   = -(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx], dim=1)).sum(dim=1)  # (N,)
+                    ce_neighbor = -(Q_t             * F.log_softmax(spatial_nb_output,                  dim=1)).sum(dim=1)  # (N,)
+
+                    # Áp dụng trọng số alpha_ij (detach để gradient không chảy ngược qua attention)
+                    spatial_loss = (alpha_ij.detach() * (ce_anchor + ce_neighbor)).sum() / 2
+                    # ─────────────────────────────────────────────────────────────────────
 
                     #             feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
                     feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
