@@ -668,56 +668,21 @@ class SPANN_model:
                     batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
                     # Spatial alignment loss
                     if iteration > miditer3:
-                        # ── Spatial Contrastive Loss / InfoNCE (thay thế Frobenius norm) ──────
-                        # Positive pairs: các tế bào lân cận vật lý (top-k gần nhất theo tọa độ).
-                        # Negative pairs: các tế bào không phải hàng xóm — lấy mẫu ngẫu nhiên.
-                        # InfoNCE kéo positive gần nhau và đẩy negative ra xa trong không gian Z_sp.
-
-                        # Lấy latent Z của các high-confidence cells và L2-normalize
-                        z_sp = F.normalize(mu_target[high_conf_idx], dim=1)  # (N, D)
-                        N = z_sp.size(0)
-
-                        # --- FIX LỖI "OUT OF RANGE" Ở ĐÂY ---
-                        # Đảm bảo số lượng hàng xóm k không vượt quá số lượng tế bào hợp lệ.
-                        # Dùng N - 1 vì ta không tính chính nó làm hàng xóm.
-                        actual_k = min(k, N - 1)
-
-                        if actual_k <= 0:
-                            # Nếu N = 0 hoặc N = 1, không đủ tế bào để tạo cặp (pairs)
-                            # Đặt loss = 0 để bỏ qua batch này, tránh báo lỗi.
-                            spa_loss = torch.tensor(0.0, device=self.device)
-                        else:
-                            # Tính ma trận khoảng cách vật lý để xác định positive pairs
-                            coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)  # (N, N)
-                            
-                            # top-k lân cận không gian gần nhất (bỏ diagonal bằng cách cộng dồn giá trị lớn)
-                            coor_dist_diag_fill = coor_dist_mat + torch.max(coor_dist_mat) * torch.eye(N, device=self.device)
-                            
-                            # Dùng actual_k thay vì k
-                            pos_idx = torch.topk(coor_dist_diag_fill, k=actual_k, largest=False)[1]  # (N, actual_k)
-
-                            # Xây dựng boolean mask: pos_mask[i, j] = True nếu j là neighbor của i
-                            pos_mask = torch.zeros(N, N, dtype=torch.bool, device=self.device)
-                            pos_mask.scatter_(1, pos_idx, True)  # (N, N)
-
-                            # Ma trận cosine similarity giữa tất cả các cặp tế bào
-                            # Chia temperature tau để kiểm soát độ sắc nét của phân phối
-                            sim_matrix = torch.matmul(z_sp, z_sp.t()) / self.tau  # (N, N)
-                            
-                            # Triệt tiêu diagonal (self-similarity) bằng giá trị rất âm (-inf)
-                            sim_matrix = sim_matrix.masked_fill(torch.eye(N, dtype=torch.bool, device=self.device), float('-inf'))
-
-                            # InfoNCE Loss (vectorized, không dùng vòng lặp for):
-                            # L_i = -mean_{j ∈ pos(i)} [ s_{ij}/tau - log Σ_{l≠i} exp(s_{il}/tau) ]
-                            log_sum_exp = torch.logsumexp(sim_matrix, dim=1, keepdim=True)  # (N, 1)
-                            # log-softmax của tất cả cặp: log_prob[i,j] = s_ij/tau - log Σ exp
-                            log_prob = sim_matrix - log_sum_exp  # (N, N)
-                            
-                            # Tính trung bình log-likelihood trên tất cả positive pairs của mỗi anchor
-                            num_pos = pos_mask.float().sum(dim=1).clamp(min=1)  # (N,) — tránh lỗi chia 0
-                            spa_loss = -(log_prob * pos_mask.float()).sum(dim=1) / num_pos  # (N,)
-                            spa_loss = spa_loss.mean()
-                        # ─────────────────────────────────────────────────────────────────────
+                         # Spatial alignment loss
+                        spa_dist_mat = distance_gmm(
+                            mu_target[high_conf_idx],
+                            mu_target[high_conf_idx],
+                            var_target[high_conf_idx],
+                            var_target[high_conf_idx],
+                        )
+                        spa_dist_mat = spa_dist_mat / torch.max(spa_dist_mat)
+                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)
+                        coor_dist_mat = coor_dist_mat / torch.max(coor_dist_mat)
+                        index = torch.topk(coor_dist_mat, k=k, largest=False)[1]
+                        for i in range(len(id_target_high_conf)):
+                            spa_loss += torch.norm(spa_dist_mat[i][index[i]] - coor_dist_mat[i][index[i]]) / (k - 1)
+                        spa_loss /= len(id_target_high_conf)
+                    
                     # cell type ot alignment
                     if beta is None:
                         beta = ot.unif(source_prototype.size()[0])
