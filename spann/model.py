@@ -1152,29 +1152,28 @@ class SPANN_model:
                     # ── Adaptive-weight L_neighbor_sp (chống Over-smoothing) ──────────────
                     # Lấy latent feature (before_lincls_feat_t) của các high-conf cells và
                     # L2-normalize để tính cosine similarity một cách vectorized.
-                    z_hc = F.normalize(before_lincls_feat_t[high_conf_idx], dim=1)  # (N, D)
+                    N_high_conf = len(batch_coor_high_conf)
+                    
+                    if N_high_conf > 0:
+                        z_hc = F.normalize(before_lincls_feat_t[high_conf_idx], dim=1)  # (N, D)
+                        cos_sim = (z_hc * z_hc[spatial_nb_idx]).sum(dim=1)  # (N,)
 
-                    # Dot product giữa L2-normalized vectors = cosine similarity.
-                    # z_hc[spatial_nb_idx] là latent của neighbor tương ứng với mỗi anchor.
-                    cos_sim = (z_hc * z_hc[spatial_nb_idx]).sum(dim=1)  # (N,)
+                        # Dùng Sigmoid thay vì Clamp để tránh triệt tiêu loss quá sớm ở epoch đầu
+                        alpha_ij = torch.sigmoid(cos_sim)  # (N,), giá trị mượt mà trong (0, 1)
 
-                    # Chuyển thành trọng số alpha_ij trong khoảng [0, 1].
-                    # clamp_min(0) (tương đương ReLU): nếu hai tế bào ở ranh giới mô
-                    # (cos_sim < 0 → hoàn toàn khác nhau) thì alpha_ij = 0,
-                    # loss cặp đó bị triệt tiêu hoàn toàn — không ép chia sẻ nhãn.
-                    alpha_ij = torch.clamp(cos_sim, min=0.0)  # (N,), giá trị trong [0, 1]
+                        spatial_nb_output = after_lincls_t[high_conf_idx][spatial_nb_idx, :]
+                        neighbor_Q_spatial = Q_t[spatial_nb_idx, :]
+                        
+                        ce_anchor   = -(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx], dim=1)).sum(dim=1)  # (N,)
+                        ce_neighbor = -(Q_t             * F.log_softmax(spatial_nb_output,                  dim=1)).sum(dim=1)  # (N,)
 
-                    # Cross-entropy có trọng số adaptive theo cả hai chiều anchor↔neighbor
-                    spatial_nb_output = after_lincls_t[high_conf_idx][spatial_nb_idx, :]
-                    neighbor_Q_spatial = Q_t[spatial_nb_idx, :]
-                    ce_anchor   = -(neighbor_Q_spatial * F.log_softmax(after_lincls_t[high_conf_idx], dim=1)).sum(dim=1)  # (N,)
-                    ce_neighbor = -(Q_t             * F.log_softmax(spatial_nb_output,                  dim=1)).sum(dim=1)  # (N,)
-
-                    # Áp dụng trọng số alpha_ij (detach để gradient không chảy ngược qua attention)
-                    spatial_loss = (alpha_ij.detach() * (ce_anchor + ce_neighbor)).sum() / 2
+                        # QUAN TRỌNG: Phải chia cho N_high_conf để tránh bùng nổ scale loss!
+                        spatial_loss = (alpha_ij.detach() * (ce_anchor + ce_neighbor)).sum() / (2 * N_high_conf)
+                    else:
+                        spatial_loss = torch.tensor(0.0).to(self.device)
                     # ─────────────────────────────────────────────────────────────────────
-
-                    #             feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
+                    
+                    #feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
                     feat_mat = torch.matmul(norm_feat_t[high_conf_idx], norm_feat_t[high_conf_idx].t()) / temp
                     mask = torch.eye(feat_mat.size(0), feat_mat.size(0)).bool().to(self.device)
                     feat_mat.masked_fill_(mask, -1 / temp)
