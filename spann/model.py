@@ -741,8 +741,8 @@ class SPANN_model:
                         z_hc = F.normalize(before_lincls_feat_t[high_conf_idx], dim=1)  # (N, D)
                         cos_sim = (z_hc * z_hc[spatial_nb_idx]).sum(dim=1)  # (N,)
 
-                        # Dùng Sigmoid thay vì Clamp để tránh triệt tiêu loss quá sớm ở epoch đầu
-                        alpha_ij = torch.sigmoid(cos_sim)  # (N,), giá trị mượt mà trong (0, 1)
+                        # Thay thế dòng Sigmoid cũ bằng dòng Clamp (ReLU) này:
+                        alpha_ij = torch.clamp(cos_sim, min=0.0)
 
                         spatial_nb_output = after_lincls_t[high_conf_idx][spatial_nb_idx, :]
                         neighbor_Q_spatial = Q_t[spatial_nb_idx, :]
