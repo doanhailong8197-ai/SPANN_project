@@ -668,20 +668,33 @@ class SPANN_model:
                     batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
                     # Spatial alignment loss
                     if iteration > miditer3:
-                         # Spatial alignment loss
-                        spa_dist_mat = distance_gmm(
-                            mu_target[high_conf_idx],
-                            mu_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                            var_target[high_conf_idx],
-                        )
-                        spa_dist_mat = spa_dist_mat / torch.max(spa_dist_mat)
-                        coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)
-                        coor_dist_mat = coor_dist_mat / torch.max(coor_dist_mat)
-                        index = torch.topk(coor_dist_mat, k=k, largest=False)[1]
-                        for i in range(len(id_target_high_conf)):
-                            spa_loss += torch.norm(spa_dist_mat[i][index[i]] - coor_dist_mat[i][index[i]]) / (k - 1)
-                        spa_loss /= len(id_target_high_conf)
+                        num_high_conf = len(id_target_high_conf)
+                        
+                        # Chỉ tính toán nếu có ít nhất 2 tế bào high-confidence trong batch
+                        if num_high_conf > 1:
+                            # Tự động điều chỉnh k: lấy giá trị nhỏ nhất giữa k mục tiêu và số tế bào hiện có
+                            current_k = min(k, num_high_conf)
+                            
+                            spa_dist_mat = distance_gmm(
+                                mu_target[high_conf_idx],
+                                mu_target[high_conf_idx],
+                                var_target[high_conf_idx],
+                                var_target[high_conf_idx],
+                            )
+                            spa_dist_mat = spa_dist_mat / torch.max(spa_dist_mat)
+                            
+                            coor_dist_mat = pdists(batch_coor[high_conf_idx], squared=True)
+                            coor_dist_mat = coor_dist_mat / torch.max(coor_dist_mat)
+                            
+                            # Dùng current_k thay vì k cứng
+                            index = torch.topk(coor_dist_mat, k=current_k, largest=False)[1]
+                            
+                            for i in range(num_high_conf):
+                                # Mẫu số an toàn (current_k - 1) để tránh chia cho 0
+                                denominator = max(1, current_k - 1)
+                                spa_loss += torch.norm(spa_dist_mat[i][index[i]] - coor_dist_mat[i][index[i]]) / denominator
+                                
+                            spa_loss /= num_high_conf
                     
                     # cell type ot alignment
                     if beta is None:
