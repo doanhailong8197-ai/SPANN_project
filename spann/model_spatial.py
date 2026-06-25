@@ -672,25 +672,37 @@ class SPANN_model:
                         if num_high_conf > 1:
                             current_k = min(k, num_high_conf)
                             
-                            # Bước 1: Tính toán độ tương đồng đặc trưng góc ẩn cục bộ (Cosine Similarity + ReLU)
+                            # Bước 1: Tính toán độ tương đồng đặc trưng góc ẩn cục bộ (Cosine Similarity)
                             z_hc = norm_feat_t[high_conf_idx]  # Biểu diễn ẩn đã L2-normalize của các tế bào high-conf
-                            feat_sim = torch.matmul(z_hc, z_hc.t())
-                            feat_sim_relu = torch.clamp(feat_sim, min=0.0)  # Bộ lọc cổng chặn đứng lực hút sai lệch
+                            feat_sim = torch.matmul(z_hc, z_hc.t()) # Giá trị trong khoảng [-1, 1]
                             
-                            # Bước 2: Tính khoảng cách hình học thực tế và chuyển sang RBF Kernel phi tuyến
+                            # Bước 2: Tính ma trận khoảng cách hình học và chuyển sang cấu trúc kề mềm rbf (0 đến 1)
                             coor_dist_mat = pdists(batch_coor_high_conf, squared=True)
-                            sigma = 0.2  # Siêu tham số bán kính hốc sinh học (bạn có thể tinh chỉnh từ 0.1 đến 0.3)
-                            coor_rbf = torch.exp(-coor_dist_mat / (2 * (sigma ** 2)))
+                            sigma = 0.2  # Siêu tham số bán kính hốc sinh học
+                            coor_rbf = torch.exp(-coor_dist_mat / (2 * (sigma ** 2))) # Đóng vai trò là ma trận kề mềm A_coor
                             
-                            # Bước 3: Xây dựng ma trận mặt nạ cục bộ (k-NN Spatial Mask) song song hóa
+                            # Bước 3: Xây dựng ma trận mặt nạ cục bộ (k-NN Spatial Mask) 
+                            # Chỉ tính toán Loss cho các cặp nằm trong k-NN để đảm bảo tính tập trung cục bộ
                             _, knn_index = torch.topk(coor_dist_mat, k=current_k, largest=False)
                             mask = torch.zeros_like(coor_dist_mat)
-                            mask.scatter_(1, knn_index, 1.0)  # Gán 1.0 tại các vị trí hàng xóm gần địa lý
+                            mask.scatter_(1, knn_index, 1.0)
                             
-                            # Bước 4: Tính toán MSE Loss phân tán cục bộ trên vùng phân phối của Mask
-                            spa_loss = torch.sum(mask * (feat_sim_relu - coor_rbf) ** 2) / (mask.sum() + 1e-10)
+                            # Bước 4: Áp dụng Contrastive Margin Loss
+                            # Định nghĩa siêu tham số (Hyperparameters) nhằm giữ vững cấu trúc cụm tế bào Known
+                            margin = 0.5  # Ngưỡng an toàn: cho phép các điểm ở xa có similarity tối đa là 0.5 mà không bị phạt
+                            alpha = 0.2   # Trọng số giảm bớt lực đẩy của các tế bào xa nhau không gian
+                            
+                            # Lực kéo (Positive Loss): Các điểm gần nhau trong không gian (coor_rbf tiến về 1) thì cần tương đồng nhau
+                            loss_pos = coor_rbf * (1.0 - feat_sim) ** 2
+                            
+                            # Lực đẩy (Negative Loss): Các điểm xa nhau trong không gian (coor_rbf tiến về 0) thì đẩy ra xa nếu vượt margin
+                            loss_neg = (1.0 - coor_rbf) * torch.clamp(feat_sim - margin, min=0.0) ** 2
+                            
+                            # Tổng hợp loss và chỉ tính toán trên vùng mặt nạ k-NN đã xác định để tránh nhiễu diện rộng
+                            total_contrastive_loss = loss_pos + alpha * loss_neg
+                            spa_loss = torch.sum(mask * total_contrastive_loss) / (mask.sum() + 1e-10)
                         else:
-                            spa_loss = torch.tensor(0.0).to(self.device)                    
+                            spa_loss = torch.tensor(0.0).to(self.device)
                     # cell type ot alignment
                     if beta is None:
                         beta = ot.unif(source_prototype.size()[0])
