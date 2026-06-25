@@ -543,8 +543,8 @@ class SPANN_model:
         miditer2=5000,
         miditer3=4000,
         test_freq=1000,
-        sigma=0.15,
-        margin=0.4,
+        sigma=0.2,
+        margin=0.5,
         alpha=0.2
     ):
         """
