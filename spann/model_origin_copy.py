@@ -503,15 +503,6 @@ class SPANN_model:
     :device: device on which SPAMM model is aranged
 
     """
-
-    class SPANN_model:
-    """
-    SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset
-    """
-    class SPANN_model:
-    """
-    SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset
-    """
     def __init__(self, x_dim, z_dim, enc, dec, class_num, device, n_gmm_clusters=None):
         super().__init__()
         self.class_num = class_num
