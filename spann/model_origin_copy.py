@@ -504,15 +504,21 @@ class SPANN_model:
 
     """
 
-    def __init__(self, x_dim, z_dim, enc, dec, class_num, device):
-        super().__init__()
-        self.class_num = class_num
+    def __init__(self, x_dim, z_dim, enc, dec, class_num, device, n_gmm_clusters=None):
+        super(SPANN_model, self).__init__()
+        self.enc = enc.to(device)
+        self.dec = dec.to(device)
         self.device = device
-        self.feat_dim = enc[-1][1]
-        self.encoder = Encoder(x_dim, enc).to(device)
-        self.decoder = Decoder(z_dim, dec).to(device)
-        self.classifier = CLS(z_dim, class_num).to(device)
-        self.gmm_prior = GMMPrior(latent_dim=z_dim, n_clusters=class_num).to(device)
+        self.class_num = class_num
+        self.feat_dim = 128
+        
+        # Nếu không truyền n_gmm_clusters, mặc định bằng class_num
+        if n_gmm_clusters is None:
+            n_gmm_clusters = class_num
+            
+        from vade_prior import GMMPrior
+        self.gmm_prior = GMMPrior(latent_dim=z_dim, n_clusters=n_gmm_clusters).to(device)
+        # -----------------------------
 
     def train(
         self,
