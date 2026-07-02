@@ -508,21 +508,24 @@ class SPANN_model:
     """
     SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset
     """
+    class SPANN_model:
+    """
+    SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset
+    """
     def __init__(self, x_dim, z_dim, enc, dec, class_num, device, n_gmm_clusters=None):
-        super(SPANN_model, self).__init__()
-        self.enc = enc.to(device)
-        self.dec = dec.to(device)
-        self.device = device
+        super().__init__()
         self.class_num = class_num
-        self.feat_dim = 128
+        self.device = device
+        self.feat_dim = enc[-1][1]
         
-        # Nếu không truyền n_gmm_clusters, mặc định bằng class_num
+        self.encoder = Encoder(x_dim, enc).to(device)
+        self.decoder = Decoder(z_dim, dec).to(device)
+        self.classifier = CLS(z_dim, class_num).to(device)
+        
         if n_gmm_clusters is None:
             n_gmm_clusters = class_num
             
-        from vade_prior import GMMPrior
         self.gmm_prior = GMMPrior(latent_dim=z_dim, n_clusters=n_gmm_clusters).to(device)
-        # -----------------------------
 
     def train(
         self,
